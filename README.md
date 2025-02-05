@@ -18,3 +18,24 @@ student@login04:~/hw1> git remote rename origin staff
 student@login04:~/hw1> git remote add origin https://github.com/YOUR_GITHUB_USERNAME/cs267-hw1.git
 student@login04:~/hw1> git push -u origin master
 ```
+
+
+## Split up the optimization techniques
+
+### Patrick
+  [ ] transposing
+  [ ] repacking
+  
+### Tiffany
+  [x] loop re-ordering
+  [ ] microkernel
+  
+### Ishaq
+ [ ] multi-level blocking
+
+### whoever grabs it
+  [ ] inline assembly
+  [ ] prefetching
+
+
+
