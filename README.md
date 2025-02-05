@@ -23,19 +23,19 @@ student@login04:~/hw1> git push -u origin master
 ## Split up the optimization techniques
 
 ### Patrick
-  [ ] transposing
-  [ ] repacking
+ - [ ] transposing
+ - [ ] repacking
   
 ### Tiffany
-  [x] loop re-ordering
-  [ ] microkernel
+ - [x] loop re-ordering
+ - [ ] microkernel
   
 ### Ishaq
- [ ] multi-level blocking
+- [ ] multi-level blocking
 
 ### whoever grabs it
-  [ ] inline assembly
-  [ ] prefetching
+ - [ ] inline assembly
+ - [ ] prefetching
 
 
 
