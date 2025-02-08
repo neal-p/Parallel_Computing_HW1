@@ -17,6 +17,22 @@ const char* dgemm_desc = "Optimized blocked dgemm with SIMD";
 static void do_block(int lda, int M, int N, int K, double* A, double* B, double* C) {
     int M4 = M / 4 * 4;  // round M down to nearest multiple of 4
     int K4 = K / 4 * 4;  // round K down to nearest multiple of 4
+    // double* A_local = (double*)malloc(BLOCK_SIZE * BLOCK_SIZE * sizeof(double));
+    // double* B_local = (double*)malloc(BLOCK_SIZE * BLOCK_SIZE * sizeof(double));
+    double A_local[BLOCK_SIZE * BLOCK_SIZE], B_local[BLOCK_SIZE*BLOCK_SIZE];
+
+        for (int i = 0; i < M; i++) {
+            for (int j = 0; j < K; j++) {
+                //a[i + j*BLOCK_SIZE] = A[i * lda + j];
+                A_local[i + j*BLOCK_SIZE] = A[i + j * lda];
+            }
+        }
+
+        for (int i = 0; i < K; i++) {
+            for (int j = 0; j < N; j++) {
+                B_local[i + j*BLOCK_SIZE] = B[i + j * lda];
+            }
+        }
 
     for (int j = 0; j < N; ++j) { 
         for (int i = 0; i < M4; i += 4) { 
@@ -24,17 +40,17 @@ static void do_block(int lda, int M, int N, int K, double* A, double* B, double*
             __m256d c0 = _mm256_loadu_pd(&C[i + j * lda]);
 
             for (int k = 0; k < K4; k += 4) {
-                __m256d a0 = _mm256_loadu_pd(&A[i + (k + 0) * lda]);
-                __m256d a1 = _mm256_loadu_pd(&A[i + (k + 1) * lda]);
-                __m256d a2 = _mm256_loadu_pd(&A[i + (k + 2) * lda]);
-                __m256d a3 = _mm256_loadu_pd(&A[i + (k + 3) * lda]);
+                __m256d a0 = _mm256_loadu_pd(A_local + i + (k + 0) * BLOCK_SIZE);
+                __m256d a1 = _mm256_loadu_pd(A_local + i + (k + 1) * BLOCK_SIZE);
+                __m256d a2 = _mm256_loadu_pd(A_local + i + (k + 2) * BLOCK_SIZE);
+                __m256d a3 = _mm256_loadu_pd(A_local + i + (k + 3) * BLOCK_SIZE);
 
                 // duplicates a single double value across all 4 lanes
                 // used when multiplying a row of A with a single value from B, more efficient than loading the same value 4 times 
-                __m256d b0 = _mm256_broadcast_sd(&B[(k + 0) + j * lda]);
-                __m256d b1 = _mm256_broadcast_sd(&B[(k + 1) + j * lda]);
-                __m256d b2 = _mm256_broadcast_sd(&B[(k + 2) + j * lda]);
-                __m256d b3 = _mm256_broadcast_sd(&B[(k + 3) + j * lda]);
+                __m256d b0 = _mm256_broadcast_sd(B_local + (k + 0) + j * BLOCK_SIZE);
+                __m256d b1 = _mm256_broadcast_sd(B_local + (k + 1) + j * BLOCK_SIZE);
+                __m256d b2 = _mm256_broadcast_sd(B_local + (k + 2) + j * BLOCK_SIZE);
+                __m256d b3 = _mm256_broadcast_sd(B_local + (k + 3) + j * BLOCK_SIZE);
 
                 // perform fused multiply-add, (A * B) + C
                 c0 = _mm256_fmadd_pd(a0, b0, c0);
@@ -63,6 +79,8 @@ static void do_block(int lda, int M, int N, int K, double* A, double* B, double*
             C[i + j * lda] = cij;
         }
     }
+    // free(A_local);
+    // free(B_local);
 }
 
 /* This routine performs a dgemm operation
@@ -84,3 +102,4 @@ void square_dgemm(int lda, double* A, double* B, double* C) {
                 do_block(lda, M, N, K, A + i + k * lda, B + k + j * lda, C + i + j * lda);
             }
 }
+    }}
