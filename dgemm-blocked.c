@@ -1,100 +1,112 @@
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <immintrin.h>
-const char* dgemm_desc = "Optimized blocked dgemm with SIMD";
 
 #ifndef BLOCK_SIZE
-#define BLOCK_SIZE (lda < 128 ? 32 : (lda < 512 ? 64 : 128))
+#define BLOCK_SIZE 32
 #endif
 
-#define min(a, b) (((a) < (b)) ? (a) : (b))
+const char* dgemm_desc = "Naive, three-loop dgemm.";
 
-/*
- * This auxiliary subroutine performs a smaller dgemm operation
- *  C := C + A * B
- * where C is M-by-N, A is M-by-K, and B is K-by-N.
- */
-static void do_block(int lda, int M, int N, int K, double* A, double* B, double* C) {
-    int M4 = M / 4 * 4;  // Ensure M is a multiple of 4
-    int K4 = K / 4 * 4;  // Ensure K is a multiple of 4
+// True if memory is not aligned
+// AND is alignable
+static inline int need_aligned(const void* ptr) {
+    return (((uintptr_t)ptr % BLOCK_SIZE) != 0);
+}
 
-    // Process K first for better L1 cache use
-    for (int k = 0; k < K4; k += 4) {
-        for (int j = 0; j < N; ++j) { 
-            for (int i = 0; i < M4; i += 4) { 
-                __m256d c0 = _mm256_loadu_pd(&C[i + j * lda]);
+static void dgemm_block(int n, int j_start, int j_end, int k_start, int k_end,
+                        double *A, double *B, double *C) {
+    int n_chunks = n / 4;
+    int remainder = n % 4;
 
-                __m256d a0 = _mm256_loadu_pd(&A[i + (k + 0) * lda]);
-                __m256d a1 = _mm256_loadu_pd(&A[i + (k + 1) * lda]);
-                __m256d a2 = _mm256_loadu_pd(&A[i + (k + 2) * lda]);
-                __m256d a3 = _mm256_loadu_pd(&A[i + (k + 3) * lda]);
+    for (int j = j_start; j < j_end; ++j) {       
+        for (int k = k_start; k < k_end; ++k) {     
+            int B_flat_idx = j * n + k;
+            double B_val = B[B_flat_idx];
 
-                __m256d b0 = _mm256_broadcast_sd(&B[(k + 0) + j * lda]);
-                __m256d b1 = _mm256_broadcast_sd(&B[(k + 1) + j * lda]);
-                __m256d b2 = _mm256_broadcast_sd(&B[(k + 2) + j * lda]);
-                __m256d b3 = _mm256_broadcast_sd(&B[(k + 3) + j * lda]);
+            __m256d B_val_broad = _mm256_set1_pd(B_val);
 
-                c0 = _mm256_fmadd_pd(a0, b0, c0);
-                c0 = _mm256_fmadd_pd(a1, b1, c0);
-                c0 = _mm256_fmadd_pd(a2, b2, c0);
-                c0 = _mm256_fmadd_pd(a3, b3, c0);
+            for (int chunk = 0; chunk < n_chunks; chunk++) {
+                int i = chunk * 4;
+                int A_flat_idx = k * n + i;  
+                int C_flat_idx = j * n + i; 
 
-                _mm256_storeu_pd(&C[i + j * lda], c0);
+		        if (!need_aligned(&A[A_flat_idx])) {
+                    __m256d A_col = _mm256_load_pd(&A[A_flat_idx]);
+                    __m256d C_col = _mm256_load_pd(&C[C_flat_idx]);
+                    C_col = _mm256_fmadd_pd(B_val_broad, A_col, C_col);
+                    _mm256_store_pd(&C[C_flat_idx], C_col);
+		        } else {
+                    __m256d A_col = _mm256_loadu_pd(&A[A_flat_idx]);
+                    __m256d C_col = _mm256_loadu_pd(&C[C_flat_idx]);
+                    C_col = _mm256_fmadd_pd(B_val_broad, A_col, C_col);
+                    _mm256_storeu_pd(&C[C_flat_idx], C_col);
+		        }
             }
 
-            // Handle remaining rows (M % 4 != 0)
-            for (int i = M4; i < M; ++i) {
-                double cij = C[i + j * lda];
-                for (int rem_k = k; rem_k < k + 4; ++rem_k) {
-                    if (rem_k < K) {  // Ensure we don’t go out of bounds
-                        cij += A[i + rem_k * lda] * B[rem_k + j * lda];
-                    }
+            _mm_prefetch((char*)&A[0], _MM_HINT_T0);
+
+            if (remainder > 0) {
+                int i = n_chunks * 4;
+                int A_flat_idx = k * n + i;
+                int C_flat_idx = j * n + i;
+                for (int r = 0; r < remainder; ++r) {
+                    C[C_flat_idx + r] += B_val * A[A_flat_idx + r];
                 }
-                C[i + j * lda] = cij;
-            }
-        }
-    }
-
-    // Handle remaining elements if K is not a multiple of 4
-    for (int k_rem = K4; k_rem < K; ++k_rem) {
-        for (int j = 0; j < N; ++j) { 
-            for (int i = 0; i < M4; i += 4) { 
-                __m256d c0 = _mm256_loadu_pd(&C[i + j * lda]);
-
-                __m256d a0 = _mm256_loadu_pd(&A[i + k_rem * lda]);
-                __m256d b0 = _mm256_broadcast_sd(&B[k_rem + j * lda]);
-
-                c0 = _mm256_fmadd_pd(a0, b0, c0);
-
-                _mm256_storeu_pd(&C[i + j * lda], c0);
-            }
-
-            // Handle remaining rows (M % 4 != 0)
-            for (int i = M4; i < M; ++i) {
-                C[i + j * lda] += A[i + k_rem * lda] * B[k_rem + j * lda];
             }
         }
     }
 }
 
-/* This routine performs a dgemm operation
- *  C := C + A * B
- * where A, B, and C are lda-by-lda matrices stored in column-major format.
- * On exit, A and B maintain their input values. */
-void square_dgemm(int lda, double* A, double* B, double* C) {
-    // For each block-row of A
-    for (int i = 0; i < lda; i += BLOCK_SIZE) {
-        // For each block-column of B
-        for (int j = 0; j < lda; j += BLOCK_SIZE) {
-            // Accumulate block dgemms into block of C
-            for (int k = 0; k < lda; k += BLOCK_SIZE) {
-                // Correct block dimensions if block "goes off edge of" the matrix
-                int M = min(BLOCK_SIZE, lda - i);
-                int N = min(BLOCK_SIZE, lda - j);
-                int K = min(BLOCK_SIZE, lda - k);
-                // Perform individual block dgemm
-                do_block(lda, M, N, K, A + i + k * lda, B + k + j * lda, C + i + j * lda);
+double* repack(double* M, int n) {
+    if (!need_aligned(M)) {
+        return M;
+    }
+    int size = ((((n*n) / BLOCK_SIZE) + 1) * BLOCK_SIZE);
+
+    double* aligned = aligned_alloc(BLOCK_SIZE, size * sizeof(double));
+    memcpy(aligned, M, n*n*sizeof(double));
+    return aligned;
+}
+
+void square_dgemm(int n, double* A, double* B, double* C) {
+    int BLOCK_J = BLOCK_SIZE;
+    int BLOCK_K = BLOCK_SIZE;  
+    double* A_pack;
+    double* C_pack;
+
+    // Repack matrices if n > 128
+    if (n > 128) {
+        A_pack = repack(A, n);
+        C_pack = repack(C, n);
+        
+    }
+
+    // Loop over blocks of the matrix
+    for (int j = 0; j < n; j += BLOCK_J) {
+        int j_end = (j + BLOCK_J < n) ? (j + BLOCK_J) : n;
+        for (int k = 0; k < n; k += BLOCK_K) {
+            int k_end = (k + BLOCK_K < n) ? (k + BLOCK_K) : n;
+            // Call block computation for either packed or original matrices
+            if (n > 128) {
+                dgemm_block(n, j, j_end, k, k_end, A_pack, B, C_pack);
+            } else {
+                dgemm_block(n, j, j_end, k, k_end, A, B, C);
             }
+        }
+    }
+
+    // Copy the results back to C if packed
+    if (n > 128) {
+        if (C_pack != C) {
+            memcpy(C, C_pack, n * n * sizeof(double));
+            free(C_pack);
+        }
+
+        if (A_pack != A) {
+            free(A_pack);
         }
     }
 }
