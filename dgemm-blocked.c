@@ -1,112 +1,129 @@
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <immintrin.h>
+const char* dgemm_desc = "Optimized blocked dgemm with SIMD";
 
 #ifndef BLOCK_SIZE
 #define BLOCK_SIZE 32
 #endif
 
-const char* dgemm_desc = "Naive, three-loop dgemm.";
+#define min(a, b) (((a) < (b)) ? (a) : (b))
 
-// True if memory is not aligned
-// AND is alignable
-static inline int need_aligned(const void* ptr) {
-    return (((uintptr_t)ptr % BLOCK_SIZE) != 0);
-}
+/*
+ * This auxiliary subroutine performs a smaller dgemm operation
+ *  C := C + A * B
+ * where C is M-by-N, A is M-by-K, and B is K-by-N.
+ */
+static void do_block(int lda, int M, int N, int K, double* A, double* B, double* C) {
+    int M4 = M / 4 * 4;  // round M down to nearest multiple of 4
+    int K4 = K / 4 * 4;  // round K down to nearest multiple of 4
+    int N4 = N / 4 * 4;  // round K down to nearest multiple of 4
+    double A_local[BLOCK_SIZE * BLOCK_SIZE], B_local[BLOCK_SIZE*BLOCK_SIZE];
 
-static void dgemm_block(int n, int j_start, int j_end, int k_start, int k_end,
-                        double *A, double *B, double *C) {
-    int n_chunks = n / 4;
-    int remainder = n % 4;
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < K; j++) {
+            A_local[i + j*BLOCK_SIZE] = A[i + j * lda];
+        }
+    }
 
-    for (int j = j_start; j < j_end; ++j) {       
-        for (int k = k_start; k < k_end; ++k) {     
-            int B_flat_idx = j * n + k;
-            double B_val = B[B_flat_idx];
+    for (int i = 0; i < K; i++) {
+        for (int j = 0; j < N; j++) {
+            B_local[i + j*BLOCK_SIZE] = B[i + j * lda];
+        }
+    }
 
-            __m256d B_val_broad = _mm256_set1_pd(B_val);
+    for (int j = 0; j < N4; j+=4) { 
+        for (int i = 0; i < M4; i += 4) { 
+            // load 4 double-precision floating point values, u - unaligned memory
+            __m256d c0 = _mm256_loadu_pd(&C[i + (j+0) * lda]);
+            __m256d c1 = _mm256_loadu_pd(&C[i + (j+1) * lda]);
+            __m256d c2 = _mm256_loadu_pd(&C[i + (j+2) * lda]);
+            __m256d c3 = _mm256_loadu_pd(&C[i + (j+3) * lda]);
 
-            for (int chunk = 0; chunk < n_chunks; chunk++) {
-                int i = chunk * 4;
-                int A_flat_idx = k * n + i;  
-                int C_flat_idx = j * n + i; 
+            // for (int k = 0; k < K4; k += 4) {
+            for (int k = 0; k < K4; k++) {
+                __m256d a0 = _mm256_loadu_pd(A_local + i + k * BLOCK_SIZE);
 
-		        if (!need_aligned(&A[A_flat_idx])) {
-                    __m256d A_col = _mm256_load_pd(&A[A_flat_idx]);
-                    __m256d C_col = _mm256_load_pd(&C[C_flat_idx]);
-                    C_col = _mm256_fmadd_pd(B_val_broad, A_col, C_col);
-                    _mm256_store_pd(&C[C_flat_idx], C_col);
-		        } else {
-                    __m256d A_col = _mm256_loadu_pd(&A[A_flat_idx]);
-                    __m256d C_col = _mm256_loadu_pd(&C[C_flat_idx]);
-                    C_col = _mm256_fmadd_pd(B_val_broad, A_col, C_col);
-                    _mm256_storeu_pd(&C[C_flat_idx], C_col);
-		        }
+                // duplicates a single double value across all 4 lanes
+                // used when multiplying a row of A with a single value from B, more efficient than loading the same value 4 times 
+                __m256d b0 = _mm256_broadcast_sd(B_local + k + j * BLOCK_SIZE);
+                __m256d b1 = _mm256_broadcast_sd(B_local + k + (j+1) * BLOCK_SIZE);
+                __m256d b2 = _mm256_broadcast_sd(B_local + k + (j+2) * BLOCK_SIZE);
+                __m256d b3 = _mm256_broadcast_sd(B_local + k + (j+3) * BLOCK_SIZE);
+
+                // perform fused multiply-add, (A * B) + C
+                c0 = _mm256_fmadd_pd(a0, b0, c0);
+                c1 = _mm256_fmadd_pd(a0, b1, c1);
+                c2 = _mm256_fmadd_pd(a0, b2, c2);
+                c3 = _mm256_fmadd_pd(a0, b3, c3);
             }
 
-            _mm_prefetch((char*)&A[0], _MM_HINT_T0);
-
-            if (remainder > 0) {
-                int i = n_chunks * 4;
-                int A_flat_idx = k * n + i;
-                int C_flat_idx = j * n + i;
-                for (int r = 0; r < remainder; ++r) {
-                    C[C_flat_idx + r] += B_val * A[A_flat_idx + r];
-                }
+            // Handle remaining elements if K is not a multiple of 4
+            for (int k_rem = K4; k_rem < K; ++k_rem) {
+                __m256d a0 = _mm256_loadu_pd(&A[i + k_rem * lda]);
+                __m256d b0 = _mm256_broadcast_sd(&B[k_rem + j * lda]);
+                __m256d b1 = _mm256_broadcast_sd(&B[k_rem + (j+1) * lda]);
+                __m256d b2 = _mm256_broadcast_sd(&B[k_rem + (j+2) * lda]);
+                __m256d b3 = _mm256_broadcast_sd(&B[k_rem + (j+3) * lda]);
+                c0 = _mm256_fmadd_pd(a0, b0, c0);
+                c1 = _mm256_fmadd_pd(a0, b1, c1);
+                c2 = _mm256_fmadd_pd(a0, b2, c2);
+                c3 = _mm256_fmadd_pd(a0, b3, c3);
+                
             }
+
+            // stores 4 double-precision floating-point values back into memory
+            _mm256_storeu_pd(&C[i + j * lda], c0);
+            _mm256_storeu_pd(&C[i + (j+1) * lda], c1);
+            _mm256_storeu_pd(&C[i + (j+2) * lda], c2);
+            _mm256_storeu_pd(&C[i + (j+3) * lda], c3);
+        }
+    }
+
+    // Handle Remaining Columns (N % 4 != 0)
+    for (int j = N4; j < N; ++j) {
+        for (int i = 0; i < M4; i += 4) {
+            __m256d c0 = _mm256_loadu_pd(&C[i + j * lda]);
+            for (int k = 0; k < K; ++k) {
+                __m256d a0 = _mm256_loadu_pd(&A[i + k * lda]);
+                __m256d b0 = _mm256_broadcast_sd(&B[k + j * lda]);
+                c0 = _mm256_fmadd_pd(a0, b0, c0);
+            }
+            _mm256_storeu_pd(&C[i + j * lda], c0);
+        }
+    }
+
+    // Handle Remaining Rows (M % 4 != 0)
+    for (int j = 0; j < N; ++j) {
+        for (int i = M4; i < M; ++i) {
+            double cij = C[i + j * lda];
+            for (int k = 0; k < K; ++k) {
+                cij += A[i + k * lda] * B[k + j * lda];
+            }
+            C[i + j * lda] = cij;
         }
     }
 }
 
-double* repack(double* M, int n) {
-    if (!need_aligned(M)) {
-        return M;
-    }
-    int size = ((((n*n) / BLOCK_SIZE) + 1) * BLOCK_SIZE);
+/* This routine performs a dgemm operation
+ *  C := C + A * B
+ * where A, B, and C are lda-by-lda matrices stored in column-major format.
+ * On exit, A and B maintain their input values. */
+void square_dgemm(int lda, double* A, double* B, double* C) {
+    // For each block-row of A
+    for (int i = 0; i < lda; i += BLOCK_SIZE) {
+        // For each block-column of B
+        for (int j = 0; j < lda; j += BLOCK_SIZE) {
+            // Accumulate block dgemms into block of C
+            for (int k = 0; k < lda; k += BLOCK_SIZE) {
+                // Correct block dimensions if block "goes off edge of" the matrix
+                int M = min(BLOCK_SIZE, lda - i);
+                int N = min(BLOCK_SIZE, lda - j);
+                int K = min(BLOCK_SIZE, lda - k);
 
-    double* aligned = aligned_alloc(BLOCK_SIZE, size * sizeof(double));
-    memcpy(aligned, M, n*n*sizeof(double));
-    return aligned;
-}
-
-void square_dgemm(int n, double* A, double* B, double* C) {
-    int BLOCK_J = BLOCK_SIZE;
-    int BLOCK_K = BLOCK_SIZE;  
-    double* A_pack;
-    double* C_pack;
-
-    // Repack matrices if n > 128
-    if (n > 128) {
-        A_pack = repack(A, n);
-        C_pack = repack(C, n);
-        
-    }
-
-    // Loop over blocks of the matrix
-    for (int j = 0; j < n; j += BLOCK_J) {
-        int j_end = (j + BLOCK_J < n) ? (j + BLOCK_J) : n;
-        for (int k = 0; k < n; k += BLOCK_K) {
-            int k_end = (k + BLOCK_K < n) ? (k + BLOCK_K) : n;
-            // Call block computation for either packed or original matrices
-            if (n > 128) {
-                dgemm_block(n, j, j_end, k, k_end, A_pack, B, C_pack);
-            } else {
-                dgemm_block(n, j, j_end, k, k_end, A, B, C);
+                // Perform individual block dgemm
+                do_block(lda, M, N, K, A + k * lda + i, B + k + j * lda, C + i + j * lda);
             }
-        }
-    }
-
-    // Copy the results back to C if packed
-    if (n > 128) {
-        if (C_pack != C) {
-            memcpy(C, C_pack, n * n * sizeof(double));
-            free(C_pack);
-        }
-
-        if (A_pack != A) {
-            free(A_pack);
         }
     }
 }
